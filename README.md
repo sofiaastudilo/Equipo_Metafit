@@ -3,7 +3,7 @@
 Bienvenido a la rama de trabajo de la dirección del proyecto. Esta sección es administrada por el líder técnico para garantizar la integridad del código.
 
 ## 👤 Perfil del Integrante
-**Nombre:** Juan Sebastián Carvajal
+**Nombre:** Juan Sebastián Carvajal 
 
 ---
 

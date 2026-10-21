@@ -1,0 +1,320 @@
+// controllers/planController.js
+// Hardened: BUG-010 — todos los catch ahora usan log interno + mensaje genérico al cliente.
+'use strict';
+const PlanModel = require('../models/planModel');
+const { enviarPushAUsuarioDelCiclo } = require('../services/pushService');
+
+// Recomendación diaria de agua en vasos (opcional).
+// Devuelve undefined si el campo no vino, null si se envió vacío,
+// NaN si es inválido y el entero cuando es correcto.
+function normalizarRecomendacionAgua(valor) {
+  if (valor === undefined) return undefined;
+  if (valor === null || valor === '') return null;
+  const n = Number(valor);
+  if (!Number.isInteger(n) || n < 0 || n > 50) return NaN;
+  return n;
+}
+
+const PlanController = {
+
+  // ── PLAN ENTRENAMIENTO ────────────────────────────────────
+  getEntrenamiento: async (req, res) => {
+    try {
+      const plan = await PlanModel.getEntrenamientoByCiclo(req.params.id_ciclo);
+      if (!plan) return res.status(404).json({ error: 'Plan de entrenamiento no encontrado para este ciclo' });
+      res.json(plan);
+    } catch (err) {
+      console.error('[planController.getEntrenamiento]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  // FASE A.3: rutina del día filtrada por su grupo muscular
+  getRutinaDiaria: async (req, res) => {
+    const diaNumero = Number.parseInt(req.params.dia_numero, 10);
+    if (!Number.isInteger(diaNumero) || diaNumero < 1 || diaNumero > 7) {
+      return res.status(400).json({ error: 'dia_numero debe estar entre 1 y 7' });
+    }
+    try {
+      const rutina = await PlanModel.getRutinaDiaria(
+        req.params.id_ciclo, diaNumero, req.query.grupo_muscular
+      );
+      if (!rutina) {
+        return res.status(404).json({ error: 'No hay rutina para ese día en este ciclo' });
+      }
+      res.json(rutina);
+    } catch (err) {
+      console.error('[planController.getRutinaDiaria]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  createEntrenamiento: async (req, res) => {
+    const { id_ciclo, observaciones } = req.body;
+    if (!id_ciclo) return res.status(400).json({ error: 'id_ciclo es requerido' });
+    try {
+      const id = await PlanModel.createEntrenamiento(
+        id_ciclo, req.user.sub, observaciones
+      );
+      void enviarPushAUsuarioDelCiclo(id_ciclo, {
+        title: '🏋️ Nueva rutina asignada',
+        body: 'Tu entrenador te asignó un plan de entrenamiento. ¡A darle!',
+        data: { screen: 'Rutina' },
+      });
+      res.status(201).json({ id_ciclo: id, message: 'Plan de entrenamiento creado' });
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY')
+        return res.status(400).json({ error: 'Este ciclo ya tiene un plan de entrenamiento' });
+      console.error('[planController.createEntrenamiento]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  updateEntrenamiento: async (req, res) => {
+    try {
+      await PlanModel.updateEntrenamiento(req.params.id, req.body, req.user.sub);
+      res.json({ message: 'Plan de entrenamiento actualizado' });
+    } catch (err) {
+      console.error('[planController.updateEntrenamiento]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  // ── RUTINAS ───────────────────────────────────────────────
+  createRutina: async (req, res) => {
+    const { id_ciclo, nombre_rutina, enfoque_muscular, dia_numero } = req.body;
+    if (!id_ciclo || !nombre_rutina || !dia_numero)
+      return res.status(400).json({ error: 'id_ciclo, nombre_rutina y dia_numero son requeridos' });
+    if (dia_numero < 1 || dia_numero > 7)
+      return res.status(400).json({ error: 'dia_numero debe estar entre 1 y 7' });
+    try {
+      const id = await PlanModel.createRutina(
+        id_ciclo, nombre_rutina, enfoque_muscular, dia_numero
+      );
+      res.status(201).json({ id, message: 'Rutina creada correctamente' });
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY')
+        return res.status(400).json({ error: `Ya existe una rutina el día ${dia_numero} en este ciclo` });
+      console.error('[planController.createRutina]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  addEjercicio: async (req, res) => {
+    const { id_ejercicio, series, repeticiones, orden } = req.body;
+    if (!id_ejercicio || !series || !repeticiones || !orden)
+      return res.status(400).json({ error: 'id_ejercicio, series, repeticiones y orden son requeridos' });
+    try {
+      await PlanModel.addEjercicioToRutina(
+        req.params.id_rutina, id_ejercicio, series, repeticiones, orden
+      );
+      res.status(201).json({ message: 'Ejercicio añadido a la rutina' });
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY')
+        return res.status(400).json({ error: 'Ese ejercicio ya está en la rutina o ese orden ya existe' });
+      console.error('[planController.addEjercicio]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  // Parte 2: PATCH /planes/rutinas/:id_rutina/ejercicios/:id_ejercicio
+  // Actualiza series, repeticiones (y opcionalmente peso_kg/descanso_seg) en la
+  // rutina + descripcion del ejercicio en el catálogo.
+  updateEjercicio: async (req, res) => {
+    const { id_rutina, id_ejercicio } = req.params;
+    const { series, repeticiones, descripcion, peso_kg, descanso_seg } = req.body;
+    if (series === undefined && repeticiones === undefined && descripcion === undefined
+        && peso_kg === undefined && descanso_seg === undefined) {
+      return res.status(400).json({ error: 'Envía al menos series, repeticiones, peso_kg, descanso_seg o descripcion' });
+    }
+    try {
+      let affected = 0;
+      if (series !== undefined || repeticiones !== undefined || peso_kg !== undefined || descanso_seg !== undefined) {
+        affected = await PlanModel.updateEjercicioEnRutina(id_rutina, id_ejercicio, {
+          series:       series       !== undefined ? Number(series)       : undefined,
+          repeticiones: repeticiones !== undefined ? Number(repeticiones) : undefined,
+          peso_kg:      peso_kg      !== undefined ? Number(peso_kg)      : undefined,
+          descanso_seg: descanso_seg !== undefined ? Number(descanso_seg) : undefined,
+        });
+      }
+      if (descripcion !== undefined) {
+        await PlanModel.updateDescripcionEjercicio(id_ejercicio, descripcion);
+      }
+      if (affected === 0 && descripcion === undefined) {
+        return res.status(404).json({ error: 'Ejercicio no encontrado en esa rutina' });
+      }
+      res.json({ message: 'Ejercicio actualizado correctamente', affected });
+    } catch (err) {
+      if (err.code === 'ER_CHECK_CONSTRAINT_VIOLATED') {
+        return res.status(400).json({ error: 'series, repeticiones, peso_kg o descanso_seg inválidos' });
+      }
+      console.error('[planController.updateEjercicio]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  removeEjercicio: async (req, res) => {
+    try {
+      const affected = await PlanModel.removeEjercicioFromRutina(
+        req.params.id_rutina, req.params.id_ejercicio
+      );
+      if (affected === 0) {
+        return res.status(404).json({ error: 'Ejercicio no encontrado en esa rutina' });
+      }
+      res.json({ message: 'Ejercicio eliminado de la rutina', affected });
+    } catch (err) {
+      console.error('[planController.removeEjercicio]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  deleteRutina: async (req, res) => {
+    try {
+      await PlanModel.deleteRutina(req.params.id_rutina);
+      res.json({ message: 'Rutina eliminada correctamente' });
+    } catch (err) {
+      console.error('[planController.deleteRutina]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  // ── PLAN NUTRICIONAL ──────────────────────────────────────
+  getNutricional: async (req, res) => {
+    try {
+      const plan = await PlanModel.getNutricionalByCiclo(req.params.id_ciclo);
+      if (!plan) return res.status(404).json({ error: 'Plan nutricional no encontrado para este ciclo' });
+      res.json(plan);
+    } catch (err) {
+      console.error('[planController.getNutricional]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  createNutricional: async (req, res) => {
+    // Acepta tanto nombres nuevos (calorias_objetivo/num_comidas) como legacy
+    const id_ciclo          = req.body.id_ciclo;
+    const calorias_objetivo = req.body.calorias_objetivo || req.body.calorias_estimadas;
+    const num_comidas       = req.body.num_comidas || req.body.num_comidas_diarias;
+    const observaciones     = req.body.observaciones;
+    const recAguaRaw        = normalizarRecomendacionAgua(req.body.recomendacion_agua_vasos);
+
+    if (!id_ciclo || !calorias_objetivo || !num_comidas)
+      return res.status(400).json({ error: 'id_ciclo, calorias_objetivo y num_comidas son requeridos' });
+    if (Number.isNaN(recAguaRaw))
+      return res.status(400).json({ error: 'recomendacion_agua_vasos debe ser un entero entre 0 y 50' });
+    try {
+      const recomendacion_agua_vasos = recAguaRaw ?? null;
+      const id = await PlanModel.createNutricional(
+        id_ciclo, calorias_objetivo, num_comidas, req.user.sub, observaciones,
+        recomendacion_agua_vasos
+      );
+      void enviarPushAUsuarioDelCiclo(id_ciclo, {
+        title: '🥗 Nueva dieta asignada',
+        body: 'Tu nutricionista te asignó un plan de alimentación. ¡A comer rico y sano!',
+        data: { screen: 'Dieta' },
+      });
+      res.status(201).json({ id_ciclo: id, message: 'Plan nutricional creado' });
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY')
+        return res.status(400).json({ error: 'Este ciclo ya tiene un plan nutricional' });
+      console.error('[planController.createNutricional]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  updateNutricional: async (req, res) => {
+    const calorias_objetivo = req.body.calorias_objetivo || req.body.calorias_estimadas;
+    const num_comidas       = req.body.num_comidas || req.body.num_comidas_diarias;
+    const observaciones     = req.body.observaciones;
+    const recAguaRaw        = normalizarRecomendacionAgua(req.body.recomendacion_agua_vasos);
+    if (!calorias_objetivo || !num_comidas)
+      return res.status(400).json({ error: 'calorias_objetivo y num_comidas son requeridos' });
+    if (Number.isNaN(recAguaRaw))
+      return res.status(400).json({ error: 'recomendacion_agua_vasos debe ser un entero entre 0 y 50' });
+    try {
+      await PlanModel.updateNutricional(
+        req.params.id,
+        {
+          calorias_objetivo,
+          num_comidas,
+          observaciones,
+          recomendacion_agua_vasos: recAguaRaw,
+        },
+        req.user.sub
+      );
+      res.json({ message: 'Plan nutricional actualizado' });
+    } catch (err) {
+      console.error('[planController.updateNutricional]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  addAlimento: async (req, res) => {
+    // Acepta tanto nombres nuevos (num_comida/cantidad_g) como legacy
+    const id_alimento = req.body.id_alimento;
+    const num_comida  = req.body.num_comida  || req.body.numero_comida;
+    const cantidad_g  = req.body.cantidad_g  || req.body.cantidad;
+    if (!id_alimento || !num_comida || !cantidad_g)
+      return res.status(400).json({ error: 'id_alimento, num_comida y cantidad_g son requeridos' });
+    try {
+      await PlanModel.addAlimentoToDetalle(
+        req.params.id_plan, id_alimento, num_comida, cantidad_g
+      );
+      res.status(201).json({ message: 'Alimento añadido al plan nutricional' });
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY')
+        return res.status(400).json({ error: 'Ese alimento ya está en esa comida del plan' });
+      console.error('[planController.addAlimento]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  // Parte 2: PATCH /planes/nutricional/:id_plan/detalle/:id_detalle
+  //  · cantidad_gramos/cantidad_g → cantidad_g real del schema.
+  //  · num_comida mover fila: requiere num_comida_anterior en el body.
+  updateDetalle: async (req, res) => {
+    const { id_plan, id_detalle } = req.params;
+    const cantidad_g = req.body.cantidad_g !== undefined ? req.body.cantidad_g
+      : (req.body.cantidad_gramos !== undefined ? req.body.cantidad_gramos : undefined);
+    const num_comida = req.body.num_comida;
+    const num_comida_anterior = req.body.num_comida_anterior;
+    if (cantidad_g === undefined && num_comida === undefined) {
+      return res.status(400).json({ error: 'Envía cantidad_gramos y/o num_comida' });
+    }
+    try {
+      const affected = await PlanModel.updateAlimentoEnDetalle(
+        id_plan, id_detalle, { cantidad_g, num_comida, num_comida_anterior }
+      );
+      if (affected === 0) {
+        return res.status(404).json({ error: 'Alimento no encontrado en ese plan' });
+      }
+      res.json({ message: 'Detalle nutricional actualizado', affected });
+    } catch (err) {
+      if (err.code === 'ER_DUP_ENTRY')
+        return res.status(409).json({ error: 'Ese alimento ya está en la comida destino' });
+      if (err.code === 'ER_CHECK_CONSTRAINT_VIOLATED')
+        return res.status(400).json({ error: 'cantidad_g debe ser mayor a 0' });
+      console.error('[planController.updateDetalle]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+
+  // Parte 2: DELETE /planes/nutricional/:id_plan/detalle/:id_detalle
+  removeDetalle: async (req, res) => {
+    const { id_plan, id_detalle } = req.params;
+    try {
+      const affected = await PlanModel.removeAlimentoDeDetalle(
+        id_plan, id_detalle, req.body.num_comida
+      );
+      if (affected === 0) {
+        return res.status(404).json({ error: 'Alimento no encontrado en ese plan' });
+      }
+      res.json({ message: 'Alimento eliminado del plan nutricional', affected });
+    } catch (err) {
+      console.error('[planController.removeDetalle]', err);
+      res.status(500).json({ error: 'Error interno del servidor' });
+    }
+  },
+};
+
+module.exports = PlanController;
